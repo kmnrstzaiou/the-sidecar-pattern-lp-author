@@ -1,12 +1,17 @@
-use std::net::SocketAddr;
-use std::result::Result;
-use std::convert::Infallible;
-use std::str;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, StatusCode, Server};
-pub use mysql_async::prelude::*;
-pub use mysql_async::*;
+use std::{convert::Infallible, net::SocketAddr, result::Result, str};
+
+use anyhow::anyhow;
+use hyper::{
+    service::{make_service_fn, service_fn},
+    Body, Method, Request, Response, Server, StatusCode,
+};
+pub use mysql_async::{
+    prelude::{params, Query, WithParams},
+    Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use serde_json::Value::Number;
 use tokio::time::{sleep, Duration};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -68,26 +73,19 @@ async fn handle_request(req: Request<Body>, pool: Pool) -> Result<Response<Body>
         }
 
         (&Method::POST, "/create_order") => {
-            let rate_url = "http://127.0.0.1:8001/find_rate";
-
-            let mut conn = pool.get_conn().await.unwrap();
+            let client = dapr::Dapr::new(3503);
             let byte_stream = hyper::body::to_bytes(req).await?;
             let mut order: Order = serde_json::from_slice(&byte_stream).unwrap();
+            let kvs = json!({
+                "zip": &order.shipping_zip,
+            });
+            match client.invoke_service("rate-service", "find_rate", kvs).await? {
+                Number(rate) => {
+                    let mut conn = pool.get_conn().await.unwrap();
+                    order.total = order.subtotal * (1.0 + rate.as_f64().unwrap() as f32) + order.shipping_cost;
 
-            let client = reqwest::Client::new();
-            let rate_resp = client.post(&*rate_url)
-                .body(order.shipping_zip.clone())
-                .send()
-                .await?;
-
-            if rate_resp.status().is_success() {
-                let rate = rate_resp.text()
-                    .await?
-                    .parse::<f32>()?;
-                order.total = order.subtotal * (1.0 + rate) + order.shipping_cost;
-                
-                "INSERT INTO orders (product_id, quantity, subtotal, shipping_address, shipping_zip, shipping_cost, total) VALUES (:product_id, :quantity, :subtotal, :shipping_address, :shipping_zip, :shipping_cost, :total)"
-                    .with(params! {
+                    "INSERT INTO orders (product_id, quantity, subtotal, shipping_address, shipping_zip, shipping_cost, total) VALUES (:product_id, :quantity, :subtotal, :shipping_address, :shipping_zip, :shipping_cost, :total)"
+                        .with(params! {
                         "product_id" => order.product_id,
                         "quantity" => order.quantity,
                         "subtotal" => order.subtotal,
@@ -96,16 +94,15 @@ async fn handle_request(req: Request<Body>, pool: Pool) -> Result<Response<Body>
                         "shipping_cost" => order.shipping_cost,
                         "total" => order.total,
                     })
-                    .ignore(&mut conn)
-                    .await?;
+                        .ignore(&mut conn)
+                        .await?;
 
-                drop(conn);
-                Ok(response_build(&serde_json::to_string_pretty(&order)?))
-            } else {
-                if rate_resp.status() == StatusCode::NOT_FOUND {
+                    drop(conn);
+                    Ok(response_build(&serde_json::to_string_pretty(&order)?))
+                }
+
+                _ => {
                     Ok(response_build(&String::from("{\"status\":\"error\", \"message\":\"The zip code in the order does not have a corresponding sales tax rate.\"}")))
-                } else {
-                    Ok(response_build(&String::from("{\"status\":\"error\", \"message\":\"There is an unknown error from the sales tax rate lookup service.\"}")))
                 }
             }
         }
@@ -115,8 +112,9 @@ async fn handle_request(req: Request<Body>, pool: Pool) -> Result<Response<Body>
 
             let orders = "SELECT * FROM orders"
                 .with(())
-                .map(&mut conn, |(order_id, product_id, quantity, subtotal, shipping_address, shipping_zip, shipping_cost, total)| {
-                    Order::new(
+                .map(
+                    &mut conn,
+                    |(
                         order_id,
                         product_id,
                         quantity,
@@ -125,8 +123,20 @@ async fn handle_request(req: Request<Body>, pool: Pool) -> Result<Response<Body>
                         shipping_zip,
                         shipping_cost,
                         total,
-                    )},
-                ).await?;
+                    )| {
+                        Order::new(
+                            order_id,
+                            product_id,
+                            quantity,
+                            subtotal,
+                            shipping_address,
+                            shipping_zip,
+                            shipping_cost,
+                            total,
+                        )
+                    },
+                )
+                .await?;
 
             drop(conn);
             Ok(response_build(serde_json::to_string(&orders)?.as_str()))
@@ -146,7 +156,10 @@ fn response_build(body: &str) -> Response<Body> {
     Response::builder()
         .header("Access-Control-Allow-Origin", "*")
         .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .header("Access-Control-Allow-Headers", "api,Keep-Alive,User-Agent,Content-Type")
+        .header(
+            "Access-Control-Allow-Headers",
+            "api,Keep-Alive,User-Agent,Content-Type",
+        )
         .body(Body::from(body.to_owned()))
         .unwrap()
 }
@@ -155,8 +168,9 @@ fn response_build(body: &str) -> Response<Body> {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("App started. Wait for Dapr sidecar to start ...");
     sleep(Duration::from_millis(1500)).await;
-
-    let opts = Opts::from_url("mysql://root:root@127.0.0.1:3306/mysql").unwrap();
+    let db_url = get_secret("APP_URL:DATABASE").await?;
+    println!("{}", db_url.clone());
+    let opts = Opts::from_url(&db_url).unwrap();
     let builder = OptsBuilder::from_opts(opts);
     // The connection pool will have a min of 5 and max of 10 connections.
     let constraints = PoolConstraints::new(5, 10).unwrap();
@@ -179,4 +193,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("server error: {}", e);
     }
     Ok(())
+}
+
+async fn get_secret(key: &str) -> anyhow::Result<String> {
+    let client = dapr::Dapr::new(3503);
+    let v = client
+        .get_secret("local-store", key)
+        .await?
+        .get(key)
+        .ok_or(anyhow!("failed to get key"))?
+        .to_string();
+    let mut chars = v.chars();
+    chars.next();
+    chars.next_back();
+    Ok(chars.as_str().to_string())
 }
